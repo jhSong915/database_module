@@ -96,7 +96,7 @@ public class DBConn
         }
     }
 
-    public bool CloseRs ()
+    public bool CloseRs()
     {
         try
         {
@@ -114,8 +114,9 @@ public class DBConn
 
     public bool Execute(string query, SqlCommand cmd = null)
     {
-        if (cmd == null) {
-            SqlCommand _cmd4 = new SqlCommand{ CommandText = query, Connection = conn2 };
+        if (cmd == null)
+        {
+            SqlCommand _cmd4 = new SqlCommand { CommandText = query, Connection = conn2 };
             try
             {
                 if (conn2.State == ConnectionState.Open)
@@ -127,7 +128,7 @@ public class DBConn
                 {
                     DBClose();
                     DBOpen();
-                    SqlCommand _cmd5 = new SqlCommand{ CommandText = query, Connection = conn2 };
+                    SqlCommand _cmd5 = new SqlCommand { CommandText = query, Connection = conn2 };
                     _cmd5.ExecuteNonQuery();
                     return true;
                 }
