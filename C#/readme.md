@@ -8,23 +8,20 @@ C# 기반 프로젝트에서 **SQL Server**를 안전하고 일관되게 사용�
 
 ## 목차
 
-1. [배경 및 목적](#배경-및-목적)  
-2. [핵심 기능](#핵심-기능)  
-3. [파일 구조](#파일-구조)  
-4. [DBConn 전체 코드](#dbconn-전체-코드)  
-5. [빠른 시작](#빠른-시작)  
-6. [SELECT → DataTable](#select--datatable)  
-7. [FarPoint Spread 바인딩](#farpoint-spread-바인딩)  
-8. [INSERT / UPDATE / DELETE](#insert--update--delete)  
-9. [Scalar 조회](#scalar-조회)  
-10. [트랜잭션](#트랜잭션)  
-11. [파라미터 전달 방식](#파라미터-전달-방식)  
-12. [권장 규칙](#권장-규칙)  
-13. [마이그레이션 가이드](#마이그레이션-가이드)  
-14. [문제 해결(Troubleshooting)](#문제-해결troubleshooting)  
-15. [FAQ](#faq)  
-16. [확장 아이디어](#확장-아이디어)  
-17. [변경 이력](#변경-이력)
+1. [배경 및 목적](#배경-및-목적)
+2. [핵심 기능](#핵심-기능)
+3. [파일 구조](#파일-구조)
+4. [DB 연결](#db-연결)
+5. [동기 조회](#동기-조회)
+6. #비동기-조회
+7. [FarPoint Spread 바인딩](#farpoint-spread-바인딩)
+8. [INSERT / UPDATE / DELETE](#insert--update--delete)
+9. #scalar-조회
+10. #트랜잭션
+11. [파라미터 전달 방식](#파라미터-전달-방식)
+    - [익명 객체](#익명-객체)
+    - [Dictionary](#dictionary)
+    - #sqlparameter-직접
 
 ---
 
