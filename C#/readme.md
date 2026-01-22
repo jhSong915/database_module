@@ -13,15 +13,15 @@ C# 기반 프로젝트에서 **SQL Server**를 안전하고 일관되게 사용�
 3. [파일 구조](#파일-구조)
 4. [DB 연결](#db-연결)
 5. [동기 조회](#동기-조회)
-6. #비동기-조회
+6. [비동기 조회](#비동기-조회)
 7. [FarPoint Spread 바인딩](#farpoint-spread-바인딩)
 8. [INSERT / UPDATE / DELETE](#insert--update--delete)
-9. #scalar-조회
-10. #트랜잭션
+9. [scalar 조회](#scalar-조회)
+10. [트랜잭션](#트랜잭션)
 11. [파라미터 전달 방식](#파라미터-전달-방식)
     - [익명 객체](#익명-객체)
     - [Dictionary](#dictionary)
-    - #sqlparameter-직접
+    - [SqlParameter 직접](#sqlparameter-직접)
 
 ---
 
