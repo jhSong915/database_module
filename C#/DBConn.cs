@@ -1,8 +1,9 @@
-
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Data;
 using System.Data.SqlClient;
+using System.Linq;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
@@ -10,14 +11,18 @@ using System.Threading.Tasks;
 namespace DBConn
 {
     /// <summary>
-    /// 안전하고 재사용 가능한 공통 DB 유틸리티.
-    /// - 연결은 호출 단위로 열고 닫습니다(연결 풀 사용).
-    /// - 모든 메서드는 매개변수화된 쿼리를 지원합니다.
-    /// - 동기/비동기, 트랜잭션, 취소 토큰, 타임아웃 지원.
+    /// 안전하고 고성능의 재사용 가능한 공통 DB 유틸리티입니다.
+    /// - 연결 풀 기반의 호출 단위 생명주기 관리
+    /// - 익명 객체, Dictionary, SqlParameter 파라미터 자동 바인딩 (프로퍼티 리플렉션 캐싱)
+    /// - 동기/비동기, 트랜잭션, 취소 토큰, 타임아웃, 진단 로깅 훅 지원
+    /// - DataSet 다중 결과 셋 조회 및 고속 대량 처리(BulkInsert, BulkMerge) 내장
     /// </summary>
     public class DBConn : IDisposable
     {
         public string ConnectionString { get; }
+
+        // 리플렉션 비용 최적화를 위한 프로퍼티 캐시
+        private static readonly ConcurrentDictionary<Type, PropertyInfo[]> _propertyCache = new();
 
         /// <summary>
         /// DBConn 인스턴스를 초기화합니다.
@@ -29,9 +34,9 @@ namespace DBConn
                 : throw new ArgumentNullException(nameof(connectionString));
         }
 
-        #region === 기본 빌더 ===
+        #region === 기본 빌더 & 헬퍼 ===
 
-        private static SqlCommand CreateCommand(SqlConnection conn, string sql,
+        private SqlCommand CreateCommand(SqlConnection conn, string sql,
             IEnumerable<SqlParameter>? parameters, int timeoutSeconds,
             SqlTransaction? tx = null)
         {
@@ -47,13 +52,22 @@ namespace DBConn
             if (parameters != null)
             {
                 foreach (var p in parameters)
-                    cmd.Parameters.Add(p);
+                {
+                    // 파라미터 중복 소속 방지를 위한 안전한 복제 바인딩
+                    cmd.Parameters.Add(p is ICloneable cloneable
+                        ? (SqlParameter)cloneable.Clone()
+                        : new SqlParameter(p.ParameterName, p.Value));
+                }
             }
+
+            // 진단 훅 호출
+            RaiseExecuting(sql, cmd.Parameters.Cast<SqlParameter>());
+
             return cmd;
         }
 
         /// <summary>
-        /// 익명객체/Dictionary를 SqlParameter 컬렉션으로 변환.
+        /// 익명 객체, Dictionary, SqlParameter 컬렉션을 안전하게 변환합니다.
         /// </summary>
         public static IEnumerable<SqlParameter>? ToSqlParameters(object? param)
         {
@@ -63,27 +77,45 @@ namespace DBConn
 
             if (param is IDictionary<string, object?> dict)
             {
+                var list = new List<SqlParameter>(dict.Count);
                 foreach (var kv in dict)
                 {
                     var name = kv.Key.StartsWith("@") ? kv.Key : "@" + kv.Key;
-                    yield return new SqlParameter(name, kv.Value ?? DBNull.Value);
+                    list.Add(new SqlParameter(name, kv.Value ?? DBNull.Value));
                 }
-                yield break;
+                return list;
             }
 
             var type = param.GetType();
-            var props = type.GetProperties(BindingFlags.Public | BindingFlags.Instance);
+            var props = _propertyCache.GetOrAdd(type, t => t.GetProperties(BindingFlags.Public | BindingFlags.Instance));
+            var paramList = new List<SqlParameter>(props.Length);
+
             foreach (var pi in props)
             {
                 var name = pi.Name.StartsWith("@") ? pi.Name : "@" + pi.Name;
                 var value = pi.GetValue(param, null) ?? DBNull.Value;
-                yield return new SqlParameter(name, value);
+                paramList.Add(new SqlParameter(name, value));
             }
+
+            return paramList;
+        }
+
+        private static string EscapeSqlIdentifier(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name)) return name;
+            return $"[{name.Trim().TrimStart('[').TrimEnd(']').Replace("]", "]]")}]";
+        }
+
+        private static string FormatTableName(string rawTableName)
+        {
+            if (string.IsNullOrWhiteSpace(rawTableName)) return rawTableName;
+            var parts = rawTableName.Split('.');
+            return string.Join(".", parts.Select(EscapeSqlIdentifier));
         }
 
         #endregion
 
-        #region === SELECT: DataTable ===
+        #region === SELECT: DataTable / DataSet ===
 
         public DataTable Query(string sql, object? param = null, int timeoutSeconds = 30)
         {
@@ -107,6 +139,50 @@ namespace DBConn
             var dt = new DataTable();
             dt.Load(reader);
             return dt;
+        }
+
+        /// <summary>
+        /// 세미콜론(;)으로 구분된 다중 SELECT 쿼리를 1회 왕복으로 실행하여 DataSet으로 가져옵니다. (동기)
+        /// </summary>
+        public DataSet QueryDataSet(string multiSql, string[]? tableNames = null, object? param = null, int timeoutSeconds = 30)
+        {
+            using var conn = new SqlConnection(ConnectionString);
+            conn.Open();
+
+            using var cmd = CreateCommand(conn, multiSql, ToSqlParameters(param), timeoutSeconds);
+            using var reader = cmd.ExecuteReader();
+            var ds = new DataSet();
+            ds.Load(reader, LoadOption.OverwriteChanges, tableNames ?? Array.Empty<string>());
+            return ds;
+        }
+
+        /// <summary>
+        /// 세미콜론(;)으로 구분된 다중 SELECT 쿼리를 1회 왕복으로 실행하여 DataSet으로 가져옵니다. (비동기)
+        /// </summary>
+        public async Task<DataSet> QueryDataSetAsync(string multiSql, string[]? tableNames = null, object? param = null, int timeoutSeconds = 30, CancellationToken ct = default)
+        {
+            await using var conn = new SqlConnection(ConnectionString);
+            await conn.OpenAsync(ct).ConfigureAwait(false);
+
+            await using var cmd = CreateCommand(conn, multiSql, ToSqlParameters(param), timeoutSeconds);
+            await using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+
+            var ds = new DataSet();
+            int tableIndex = 0;
+
+            do
+            {
+                var dt = new DataTable();
+                if (tableNames != null && tableIndex < tableNames.Length && !string.IsNullOrWhiteSpace(tableNames[tableIndex]))
+                {
+                    dt.TableName = tableNames[tableIndex];
+                }
+                dt.Load(reader);
+                ds.Tables.Add(dt);
+                tableIndex++;
+            } while (!reader.IsClosed && reader.NextResult());
+
+            return ds;
         }
 
         #endregion
@@ -198,7 +274,31 @@ namespace DBConn
         #region === Transaction ===
 
         /// <summary>
-        /// 트랜잭션 작업을 실행합니다. 내부에서 연결/트랜잭션을 열고 커밋/롤백을 처리합니다.
+        /// 동기 트랜잭션 작업을 실행합니다. 내부에서 커밋/롤백을 보장합니다.
+        /// </summary>
+        public void ExecuteInTransaction(
+            Action<SqlConnection, SqlTransaction> work,
+            IsolationLevel isolation = IsolationLevel.ReadCommitted,
+            int timeoutSeconds = 30)
+        {
+            using var conn = new SqlConnection(ConnectionString);
+            conn.Open();
+
+            using var tx = conn.BeginTransaction(isolation);
+            try
+            {
+                work(conn, tx);
+                tx.Commit();
+            }
+            catch
+            {
+                try { tx.Rollback(); } catch { /* swallow rollback exceptions */ }
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// 비동기 트랜잭션 작업을 실행합니다. 내부에서 커밋/롤백을 보장합니다.
         /// </summary>
         public async Task ExecuteInTransactionAsync(
             Func<SqlConnection, SqlTransaction, Task> work,
@@ -210,7 +310,6 @@ namespace DBConn
             await conn.OpenAsync(ct).ConfigureAwait(false);
 
             using var tx = conn.BeginTransaction(isolation);
-
             try
             {
                 await work(conn, tx).ConfigureAwait(false);
@@ -218,16 +317,126 @@ namespace DBConn
             }
             catch
             {
-                try { tx.Rollback(); } catch { /* swallow rollback errors */ }
+                try { tx.Rollback(); } catch { /* swallow rollback exceptions */ }
                 throw;
             }
         }
 
         #endregion
 
-        #region === Diagnostics Hook (옵션) ===
+        #region === 대량 처리 (BULK INSERT / BULK MERGE) ===
 
-        /// <summary>쿼리 실행 전 호출되는 콜백(로깅 등).</summary>
+        /// <summary>
+        /// DataTable 대용량 데이터를 SqlBulkCopy를 통해 대상 테이블에 고속으로 일괄 삽입합니다. (비동기)
+        /// </summary>
+        public async Task BulkInsertAsync(string destinationTable, DataTable dataTable, int batchSize = 5000, int timeoutSeconds = 300, CancellationToken ct = default)
+        {
+            if (dataTable == null || dataTable.Rows.Count == 0) return;
+
+            await using var conn = new SqlConnection(ConnectionString);
+            await conn.OpenAsync(ct).ConfigureAwait(false);
+
+            using var bulkCopy = new SqlBulkCopy(conn, SqlBulkCopyOptions.TableLock | SqlBulkCopyOptions.CheckConstraints | SqlBulkCopyOptions.KeepIdentity, null)
+            {
+                DestinationTableName = FormatTableName(destinationTable),
+                BatchSize = batchSize,
+                BulkCopyTimeout = timeoutSeconds
+            };
+
+            foreach (DataColumn col in dataTable.Columns)
+            {
+                bulkCopy.ColumnMappings.Add(col.ColumnName, col.ColumnName);
+            }
+
+            await bulkCopy.WriteToServerAsync(dataTable, ct).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// 임시 테이블과 MERGE 문을 활용해 대용량 데이터를 고속으로 Upsert(수정/신규삽입)합니다. (비동기)
+        /// </summary>
+        public async Task BulkMergeAsync(string targetTable, DataTable dataTable, string[] keyColumns, string[] updateColumns, string[]? insertColumns = null, int timeoutSeconds = 300, CancellationToken ct = default)
+        {
+            if (dataTable == null || dataTable.Rows.Count == 0) return;
+
+            var formattedTargetTable = FormatTableName(targetTable);
+            var tempTableName = $"#TempBulk_{Guid.NewGuid():N}";
+
+            await ExecuteInTransactionAsync(async (conn, tx) =>
+            {
+                // 1. 타겟 테이블 구조를 본뜬 빈 임시 테이블(#) 생성
+                var createTempSql = $"SELECT TOP 0 * INTO {tempTableName} FROM {formattedTargetTable};";
+                using (var cmd = CreateCommand(conn, createTempSql, null, timeoutSeconds, tx))
+                {
+                    await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+                }
+
+                // 2. 임시 테이블에 SqlBulkCopy로 고속 적재
+                using (var bulkCopy = new SqlBulkCopy(conn, SqlBulkCopyOptions.Default | SqlBulkCopyOptions.KeepIdentity, tx))
+                {
+                    bulkCopy.DestinationTableName = tempTableName;
+                    bulkCopy.BulkCopyTimeout = timeoutSeconds;
+
+                    foreach (DataColumn col in dataTable.Columns)
+                    {
+                        bulkCopy.ColumnMappings.Add(col.ColumnName, col.ColumnName);
+                    }
+
+                    await bulkCopy.WriteToServerAsync(dataTable, ct).ConfigureAwait(false);
+                }
+
+                // 3. 임시 테이블 인덱스 생성 (MERGE 성능 최적화)
+                var indexCols = string.Join(", ", keyColumns.Select(EscapeSqlIdentifier));
+                var createIndexSql = $"CREATE CLUSTERED INDEX IX_Temp_Keys ON {tempTableName} ({indexCols});";
+                using (var idxCmd = CreateCommand(conn, createIndexSql, null, timeoutSeconds, tx))
+                {
+                    await idxCmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+                }
+
+                // 4. MERGE 구문 생성 및 실행
+                var onConditions = keyColumns.Select(k => $"T.{EscapeSqlIdentifier(k)} = S.{EscapeSqlIdentifier(k)}");
+                var updateAssignments = updateColumns.Select(c => $"T.{EscapeSqlIdentifier(c)} = S.{EscapeSqlIdentifier(c)}");
+
+                var mergeSql = $@"
+                    MERGE INTO {formattedTargetTable} AS T
+                    USING {tempTableName} AS S
+                    ON ({string.Join(" AND ", onConditions)})
+                    WHEN MATCHED THEN
+                        UPDATE SET {string.Join(", ", updateAssignments)}";
+
+                if (insertColumns != null && insertColumns.Length > 0)
+                {
+                    var insertColsJoined = string.Join(", ", insertColumns.Select(EscapeSqlIdentifier));
+                    var insertValsJoined = string.Join(", ", insertColumns.Select(c => $"S.{EscapeSqlIdentifier(c)}"));
+
+                    mergeSql += $@"
+                    WHEN NOT MATCHED BY TARGET THEN
+                        INSERT ({insertColsJoined})
+                        VALUES ({insertValsJoined});";
+                }
+                else
+                {
+                    mergeSql += ";";
+                }
+
+                using (var mergeCmd = CreateCommand(conn, mergeSql, null, timeoutSeconds, tx))
+                {
+                    await mergeCmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+                }
+
+                // 5. 임시 테이블 정리
+                using (var dropCmd = CreateCommand(conn, $"DROP TABLE {tempTableName};", null, timeoutSeconds, tx))
+                {
+                    await dropCmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+                }
+
+            }, IsolationLevel.ReadCommitted, timeoutSeconds, ct).ConfigureAwait(false);
+        }
+
+        #endregion
+
+        #region === Diagnostics Hook ===
+
+        /// <summary>쿼리 실행 전 호출되는 콜백(로깅, 디버깅 등).</summary>
         public Action<string, IEnumerable<SqlParameter>?>? OnExecuting { get; set; }
 
         private void RaiseExecuting(string sql, IEnumerable<SqlParameter>? parameters)
@@ -237,8 +446,7 @@ namespace DBConn
 
         public void Dispose()
         {
-            // 현재 구조에서는 per-call로 연결을 열고 닫으므로 유지할 상태가 없습니다.
-            // 향후 연결/풀, 캐시 리소스 등을 들고 있을 경우 여기에 정리 코드를 추가하세요.
+            // per-call 패턴이므로 기본 해제 작업 없음 (호환성 유지용)
         }
     }
 }
